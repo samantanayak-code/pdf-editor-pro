@@ -5,7 +5,7 @@ import {
   FileSpreadsheet, AlignLeft, Eye, EyeOff, ArrowRight,
   ZoomIn, ZoomOut, ChevronLeft, ChevronRight,
 } from 'lucide-react';
-import { downloadFile } from '../lib/pdf/converter';
+import { downloadFile, convertPDFToWord, convertPDFTablesToExcel } from '../lib/pdf/converter';
 
 interface ConversionResult {
   type: 'success' | 'error' | 'warning';
@@ -431,45 +431,140 @@ export default function PDFConverter() {
   const { pages: pdfPages, loading: pdfLoading, error: pdfError } = usePdfPreview(selectedFile);
   const hasFile = !!selectedFile;
 
-  // ── Backend health check (cached) ──────────────────────────────────────────
-  const backendOkRef = useRef<boolean|null>(null);
-  const checkBackend = async () => {
-    if (backendOkRef.current !== null) return backendOkRef.current;
-    try { const r = await fetch('/api/health'); backendOkRef.current = r.ok; }
-    catch { backendOkRef.current = false; }
-    return backendOkRef.current;
-  };
+  // ── Client-side preview extraction ────────────────────────────────────────
+  const [wordPreviewText, setWordPreviewText] = useState<string | null>(null);
+  const [excelTablesPreview, setExcelTablesPreview] = useState<ExcelTable[] | null>(null);
 
-  // ── Auto-load previews when file is set ────────────────────────────────────
   useEffect(() => {
+    if (!selectedFile) { setWordPreviewText(null); setExcelTablesPreview(null); return; }
+
+    // Extract text preview for Word tab
+    if (conversionType === 'word') {
+      setWordPreviewLoading(true); setWordPreviewError(null);
+      const run = async () => {
+        try {
+          const pdfjs = (window as any).pdfjsLib;
+          if (!pdfjs) { throw new Error('pdf.js not loaded'); }
+          const buf = await selectedFile.arrayBuffer();
+          const pdf = await pdfjs.getDocument({ data: buf }).promise;
+          const maxPages = Math.min(pdf.numPages, 5);
+          let text = '';
+          for (let i = 1; i <= maxPages; i++) {
+            const page = await pdf.getPage(i);
+            const tc = await page.getTextContent();
+            const pageText = tc.items.map((t: any) => t.str).join(' ').trim();
+            if (pageText) text += `<p style="margin:0 0 6px 0;line-height:1.5">${pageText}</p>`;
+          }
+          setWordPreviewHtml(text || '<p style="color:#999">No text content found</p>');
+        } catch (e: any) {
+          setWordPreviewError('Preview unavailable');
+        } finally {
+          setWordPreviewLoading(false);
+        }
+      };
+      run();
+    }
+
+    // Extract table preview for Excel tab
+    if (conversionType === 'excel') {
+      setExcelPreviewLoading(true); setExcelPreviewError(null);
+      const run = async () => {
+        try {
+          const pdfjs = (window as any).pdfjsLib;
+          if (!pdfjs) { throw new Error('pdf.js not loaded'); }
+          const buf = await selectedFile.arrayBuffer();
+          const pdf = await pdfjs.getDocument({ data: buf }).promise;
+          const tables: ExcelTable[] = [];
+          // Scan first few pages for tabular content
+          for (let pi = 1; pi <= Math.min(pdf.numPages, 3); pi++) {
+            const page = await pdf.getPage(pi);
+            const tc = await page.getTextContent();
+            const items = tc.items as any[];
+            // Group items by y-position to detect rows
+            const rows = new Map<number, { text: string; x: number }[]>();
+            for (const item of items) {
+              const y = Math.round(item.transform[5] * 10);
+              if (!rows.has(y)) rows.set(y, []);
+              rows.get(y)!.push({ text: item.str, x: item.transform[4] });
+            }
+            const sortedRows = [...rows.entries()]
+              .sort((a, b) => b[0] - a[0])
+              .map(([, cols]) => cols.sort((a, b) => a.x - b.x).map(c => c.text));
+            if (sortedRows.length >= 3) {
+              const cols = Math.max(...sortedRows.map(r => r.length));
+              if (cols >= 3) {
+                tables.push({
+                  label: `Page ${pi}`,
+                  headers: sortedRows[0],
+                  rows: sortedRows.slice(1),
+                  all_rows: sortedRows,
+                  cell_fills: null,
+                  col_widths_pts: null,
+                  header_row_idx: 0,
+                });
+              }
+            }
+          }
+          setExcelTables(tables.length > 0 ? tables : null);
+          if (tables.length === 0) setExcelPreviewError('No tables detected — try converting anyway');
+        } catch (e: any) {
+          setExcelPreviewError('Table preview unavailable');
+        } finally {
+          setExcelPreviewLoading(false);
+        }
+      };
+      run();
+    }
+  }, [selectedFile, conversionType]);
+
+  // ── Convert (fully client-side) ────────────────────────────────────────────
+  const handleConvert = async () => {
     if (!selectedFile) return;
-    backendOkRef.current = null; // reset health cache
+    setConverting(true); setResult(null); setProgressPct(0);
 
-    const fd = new FormData();
-    fd.append('file', selectedFile);
-    const fname = selectedFile.name.replace(/\.pdf$/i, '');
-
-    // Word preview
-    setWordPreviewHtml(null); setWordPreviewError(null); setWordBlob(null); setWordFilename(null);
-    setWordPreviewLoading(true);
-    fetch('/api/preview/word', { method:'POST', body: fd })
-      .then(r => r.ok ? r.json() : Promise.reject('Server error'))
-      .then(d => { setWordPreviewHtml(d.html); })
-      .catch(e => { setWordPreviewError('Word preview failed — is the server running?'); })
-      .finally(() => setWordPreviewLoading(false));
-
-    // Excel preview
-    const fd2 = new FormData();
-    fd2.append('file', selectedFile);
-    setExcelTables(null); setExcelPreviewError(null); setExcelBlob(null); setExcelFilename(null);
-    setExcelPreviewLoading(true);
-    fetch('/api/preview/excel', { method:'POST', body: fd2 })
-      .then(r => r.ok ? r.json() : Promise.reject('Server error'))
-      .then(d => { setExcelTables(d.tables); })
-      .catch(() => { setExcelPreviewError('Excel preview failed — is the server running?'); })
-      .finally(() => setExcelPreviewLoading(false));
-
-  }, [selectedFile]);
+    try {
+      if (conversionType === 'word') {
+        setProgress('Extracting text from PDF…'); setProgressPct(15);
+        const result = await convertPDFToWord(
+          selectedFile,
+          { preset: wordPreset },
+          (msg) => { setProgress(msg); }
+        );
+        setProgressPct(85);
+        setProgress('Building Word document…');
+        const filename = selectedFile.name.replace(/\.pdf$/i, '.docx');
+        setWordBlob(result.blob); setWordFilename(filename);
+        setProgressPct(100);
+        setResult({ type:'success', message:`Ready: ${filename}`,
+          details:['Fully editable text', 'Click Download in the preview panel'], blob: result.blob, filename });
+      } else {
+        setProgress('Extracting tables from PDF…'); setProgressPct(15);
+        const blob = await convertPDFTablesToExcel(
+          selectedFile,
+          (msg) => { setProgress(msg); }
+        );
+        setProgressPct(85);
+        setProgress('Building Excel workbook…');
+        const filename = selectedFile.name.replace(/\.pdf$/i, '.xlsx');
+        setExcelBlob(blob); setExcelFilename(filename);
+        setProgressPct(100);
+        setResult({ type:'success', message:`Ready: ${filename}`,
+          details:['All tables on one sheet', 'Click Download in the preview panel'], blob, filename });
+      }
+    } catch (err: any) {
+      const msg = err.message === 'SCANNED_PDF'
+        ? 'Scanned PDF detected — no extractable text'
+        : err.message === 'ENCRYPTED'
+          ? 'PDF is password-protected'
+          : err.message === 'UNSUPPORTED_FORMAT'
+            ? 'Could not parse this PDF format'
+            : err.message || 'Unknown error';
+      setResult({ type:'error', message:`Conversion failed: ${msg}`,
+        details: err.message === 'SCANNED_PDF' ? ['Try a regular PDF with text content'] : [] });
+    } finally {
+      setConverting(false); setProgress('');
+    }
+  };
 
   const handleFile = (file: File) => {
     if (file.type === 'application/pdf') {
@@ -487,56 +582,6 @@ export default function PDFConverter() {
     e.preventDefault(); setDragOver(false);
     const f = e.dataTransfer.files?.[0]; if (f) handleFile(f);
   }, []);
-
-  // ── Convert (no auto-download) ──────────────────────────────────────────────
-  const handleConvert = async () => {
-    if (!selectedFile) return;
-    setConverting(true); setResult(null); setProgressPct(0);
-
-    const ok = await checkBackend();
-    if (!ok) {
-      setResult({ type:'error', message:'Backend server not running',
-        details:['Run: py server.py  in a separate terminal','Then refresh and try again.'] });
-      setConverting(false); return;
-    }
-
-    try {
-      const fd = new FormData();
-      fd.append('file', selectedFile);
-
-      if (conversionType === 'word') {
-        setProgress('Extracting text from PDF…'); setProgressPct(20);
-        const res = await fetch('/api/convert/word', { method:'POST', body: fd });
-        if (!res.ok) { const e = await res.json().catch(()=>({error:'Server error'})); throw new Error(e.error); }
-        setProgressPct(80);
-        setProgress('Building Word document…');
-        const blob = await res.blob();
-        const filename = selectedFile.name.replace(/\.pdf$/i,'.docx');
-        setWordBlob(blob); setWordFilename(filename);
-        setProgressPct(100);
-        setResult({ type:'success', message:`Ready: ${filename}`,
-          details:['Fully editable text','Click Download in the preview panel'], blob, filename });
-
-      } else {
-        setProgress('Extracting tables…'); setProgressPct(20);
-        const res = await fetch('/api/convert/excel', { method:'POST', body: fd });
-        if (!res.ok) { const e = await res.json().catch(()=>({error:'Server error'})); throw new Error(e.error); }
-        setProgressPct(80);
-        setProgress('Building Excel workbook…');
-        const blob = await res.blob();
-        const filename = selectedFile.name.replace(/\.pdf$/i,'.xlsx');
-        setExcelBlob(blob); setExcelFilename(filename);
-        setProgressPct(100);
-        setResult({ type:'success', message:`Ready: ${filename}`,
-          details:['All tables on one sheet','Click Download in the preview panel'], blob, filename });
-      }
-    } catch (err: any) {
-      setResult({ type:'error', message:`Conversion failed: ${err.message||'Unknown error'}`,
-        details:['Check that the Python server is running.'] });
-    } finally {
-      setConverting(false); setProgress('');
-    }
-  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50/30 to-slate-100">
